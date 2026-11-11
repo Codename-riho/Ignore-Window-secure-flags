@@ -1,0 +1,16 @@
+[package]
+name = "simple_flag_secure"   # menghasilkan libsimple_flag_secure.so (sama dengan SONAME modul asli)
+version = "10.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
