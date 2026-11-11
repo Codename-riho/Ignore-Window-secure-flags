@@ -1,0 +1,170 @@
+name: "Build SFS Zygisk (Rust) & Repack"
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_zip_url:
+        description: "URL zip modul asli (rilis upstream) sebagai dasar repack"
+        required: true
+        type: string
+      drop_update_json:
+        description: "Hapus baris updateJson dari module.prop (cegah upstream menimpa versi ini)"
+        type: boolean
+        default: false
+      allow_stub:
+        description: "Izinkan stub no-op (HANYA untuk uji pipeline; hasilnya tidak berfungsi)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  LIB_NAME: libsimple_flag_secure.so
+  MODULE_ID: simple_flag_secure_zygisk
+
+jobs:
+  build:
+    name: "🦀 Build & Repack"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🔎 Cari crate Rust"
+        run: |
+          set -euo pipefail
+          if   [ -f rust/Cargo.toml ]; then CRATE_DIR=rust
+          elif [ -f Cargo.toml ];      then CRATE_DIR=.
+          else
+            echo "::error::Cargo.toml tidak ditemukan (dicari di rust/ dan di akar repo). Isi repo:"
+            git ls-files | head -50
+            exit 1
+          fi
+          if [ ! -f "$CRATE_DIR/src/lib.rs" ]; then
+            echo "::error::$CRATE_DIR/src/lib.rs tidak ada. Isi repo:"
+            git ls-files | head -50
+            exit 1
+          fi
+          echo "CRATE_DIR=$CRATE_DIR" >> "$GITHUB_ENV"
+          echo "✅ Crate Rust: $CRATE_DIR"
+
+      - name: "🛑 Pengaman: tolak stub"
+        env:
+          ALLOW_STUB: ${{ inputs.allow_stub }}
+        run: |
+          set -euo pipefail
+          if grep -q 'SFS_PORT_STUB' "$CRATE_DIR/src/lib.rs"; then
+            if [ "$ALLOW_STUB" = "true" ]; then
+              echo "::warning::$CRATE_DIR/src/lib.rs masih stub. Hasil build TIDAK berfungsi (hanya uji pipeline)."
+              echo "IS_STUB=1" >> "$GITHUB_ENV"
+            else
+              echo "::error::$CRATE_DIR/src/lib.rs masih stub (ada penanda SFS_PORT_STUB). Selesaikan port dulu, atau set allow_stub=true untuk uji pipeline."
+              exit 1
+            fi
+          fi
+
+      - name: "🧰 Rust + target Android + cargo-ndk"
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+          cargo install cargo-ndk --locked
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}"
+          [ -d "$NDK" ] || { echo "::error::Android NDK tidak ditemukan di runner"; exit 1; }
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "NDK: $NDK"
+
+      - name: "🔨 Build (arm64-v8a, armeabi-v7a)"
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,-soname,libsimple_flag_secure.so"
+        run: |
+          set -euo pipefail
+          cd "$CRATE_DIR"
+          cargo ndk -t arm64-v8a -t armeabi-v7a -P 21 -o "$GITHUB_WORKSPACE/dist" build --release
+          ls -l "$GITHUB_WORKSPACE"/dist/*/
+
+      - name: "📥 Unduh & periksa zip dasar"
+        env:
+          BASE_URL: ${{ inputs.base_zip_url }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_URL" =~ ^https:// ]] || { echo "::error::base_zip_url harus HTTPS"; exit 1; }
+          curl -fL --retry 3 --retry-delay 5 -o base.zip "$BASE_URL"
+          unzip -tq base.zip >/dev/null || { echo "::error::base.zip rusak"; exit 1; }
+          rm -rf base && mkdir base && unzip -q base.zip -d base
+          grep -qx "id=${MODULE_ID}" base/module.prop \
+            || { echo "::error::module.prop bukan modul ${MODULE_ID}; zip dasar salah"; exit 1; }
+          for f in zygisk/arm64-v8a.so zygisk/armeabi-v7a.so META-INF/com/google/android/update-binary; do
+            [ -f "base/$f" ] || { echo "::error::base.zip tidak punya $f"; exit 1; }
+          done
+          echo "✅ Zip dasar valid: $(grep -m1 '^version=' base/module.prop)"
+
+      - name: "📦 Repack (hanya ganti dua .so)"
+        env:
+          DROP_UPDATE_JSON: ${{ inputs.drop_update_json }}
+        run: |
+          set -euo pipefail
+          rm -rf pkg && cp -a base pkg
+          install -m 0644 "dist/arm64-v8a/${LIB_NAME}"   pkg/zygisk/arm64-v8a.so
+          install -m 0644 "dist/armeabi-v7a/${LIB_NAME}" pkg/zygisk/armeabi-v7a.so
+
+          if [ "$DROP_UPDATE_JSON" = "true" ]; then
+            sed -i '/^updateJson=/d' pkg/module.prop
+            echo "ℹ️ Baris updateJson dihapus dari module.prop"
+          fi
+
+          # ── Verifikasi ELF ──
+          for abi in arm64-v8a armeabi-v7a; do
+            f="pkg/zygisk/$abi.so"
+            soname=$(readelf -d "$f" | sed -n 's/.*SONAME.*\[\(.*\)\]/\1/p')
+            [ "$soname" = "$LIB_NAME" ] || { echo "::error::$abi: SONAME '$soname' != $LIB_NAME"; exit 1; }
+            nm -D --defined-only "$f" | grep -qE ' T zygisk_module_entry$' \
+              || { echo "::error::$abi: simbol zygisk_module_entry tidak diekspor"; exit 1; }
+            bad=$(readelf -d "$f" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' \
+                    | grep -vxE 'liblog.so|libdl.so|libc.so|libm.so' || true)
+            [ -z "$bad" ] || { echo "::error::$abi: dependensi tak terduga: $bad"; exit 1; }
+            echo "✅ $abi: SONAME, ekspor, dan dependensi sesuai modul asli"
+          done
+
+          # ── Audit: semua file lain harus identik dengan zip asli ──
+          hashes() {
+            (cd "$1" && find . -type f ! -path './zygisk/*.so' ${2:+! -name module.prop} -print0 \
+               | sort -z | xargs -0 sha256sum)
+          }
+          EXCL=""; if [ "$DROP_UPDATE_JSON" = "true" ]; then EXCL=1; fi
+          diff <(hashes base "$EXCL") <(hashes pkg "$EXCL") \
+            && echo "✅ Semua file selain 2 .so (dan module.prop jika diubah) identik dengan zip asli" \
+            || { echo "::error::Ada file lain yang berbeda dari zip asli"; exit 1; }
+
+          # ── Susun zip (META-INF dulu) ──
+          BASE_NAME=$(basename "${{ inputs.base_zip_url }}" | sed 's/\?.*//; s/\.zip$//')
+          SUFFIX="-rust"; if [ "${IS_STUB:-0}" = "1" ]; then SUFFIX="-rust-STUB"; fi
+          OUT="${BASE_NAME}${SUFFIX}.zip"
+          rm -f "$OUT"
+          (cd pkg && zip -qr9 "../$OUT" META-INF && zip -qr9 "../$OUT" . -x 'META-INF/*')
+          sha256sum "$OUT" | tee "$OUT.sha256"
+          echo "OUT_ZIP=$OUT" >> "$GITHUB_ENV"
+
+          {
+            echo "### 🦀 Repack selesai: \`$OUT\`"
+            echo "| Berkas | Asli | Rust |"
+            echo "|---|---|---|"
+            for abi in arm64-v8a armeabi-v7a; do
+              echo "| zygisk/$abi.so | $(stat -c %s base/zygisk/$abi.so) B | $(stat -c %s pkg/zygisk/$abi.so) B |"
+            done
+            if [ "${IS_STUB:-0}" = "1" ]; then
+              echo
+              echo "> ⚠️ **STUB**: library kosong, modul tidak berfungsi."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "📤 Upload hasil"
+        uses: actions/upload-artifact@v7
+        with:
+          name: sfs-rust
+          path: |
+            ${{ env.OUT_ZIP }}
+            ${{ env.OUT_ZIP }}.sha256
+          retention-days: 14
+          if-no-files-found: error 
